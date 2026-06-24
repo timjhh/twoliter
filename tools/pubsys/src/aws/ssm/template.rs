@@ -2,7 +2,7 @@
 //! SSM parameter names and values.
 
 use super::{BuildContext, SsmKey, SsmParameters};
-use crate::aws::ami::Image;
+use crate::aws::ami::{Image, RegionAccount};
 use aws_sdk_ssm::config::Region;
 use log::trace;
 use serde::{Deserialize, Serialize};
@@ -76,6 +76,10 @@ pub(crate) async fn get_parameters(
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
 pub(crate) struct RenderedParameter {
     pub(crate) ami: Image,
+    /// The account that owns the AMI and into which this parameter will be published.  A single
+    /// region can have parameters for multiple accounts, so this is tracked separately from the
+    /// (region, name) `ssm_key`.
+    pub(crate) account_id: String,
     pub(crate) ssm_key: SsmKey,
     pub(crate) value: String,
 }
@@ -93,7 +97,7 @@ impl RenderedParameter {
 /// Render the given template parameters using the data from the given AMIs
 pub(crate) fn render_parameters(
     template_parameters: TemplateParameters,
-    amis: &HashMap<Region, Image>,
+    amis: &HashMap<RegionAccount, Image>,
     ssm_prefix: &str,
     build_context: &BuildContext<'_>,
 ) -> Result<Vec<RenderedParameter>> {
@@ -108,7 +112,8 @@ pub(crate) fn render_parameters(
         region: &'a str,
     }
     let mut new_parameters = Vec::new();
-    for (region, image) in amis {
+    for (key, image) in amis {
+        let region = &key.region;
         let context = TemplateContext {
             variant: build_context.variant,
             arch: build_context.arch,
@@ -137,6 +142,7 @@ pub(crate) fn render_parameters(
 
             new_parameters.push(RenderedParameter {
                 ami: image.clone(),
+                account_id: key.account_id.clone(),
                 ssm_key: SsmKey::new(region.clone(), join_name(ssm_prefix, &name_suffix)),
                 value,
             });
@@ -290,6 +296,7 @@ mod test {
                     public: Some(true),
                     launch_permissions: Some(vec![]),
                 },
+                account_id: "1234567890".to_string(),
                 ssm_key: SsmKey {
                     region: Region::new("us-west-2"),
                     name: "test1-parameter-name".to_string(),
@@ -303,6 +310,7 @@ mod test {
                     public: Some(true),
                     launch_permissions: Some(vec![]),
                 },
+                account_id: "1234567890".to_string(),
                 ssm_key: SsmKey {
                     region: Region::new("us-west-2"),
                     name: "test2-parameter-name".to_string(),
@@ -316,6 +324,7 @@ mod test {
                     public: Some(true),
                     launch_permissions: Some(vec![]),
                 },
+                account_id: "1234567890".to_string(),
                 ssm_key: SsmKey {
                     region: Region::new("us-east-1"),
                     name: "test3-parameter-name".to_string(),

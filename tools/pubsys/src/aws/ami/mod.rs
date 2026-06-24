@@ -11,7 +11,7 @@ use self::register::mk_amispec;
 use crate::aws::ami::launch_permissions::get_launch_permissions;
 use crate::aws::ami::public::ami_is_public;
 use crate::aws::publish_ami::{get_snapshots, modify_image, modify_snapshots, ModifyOptions};
-use crate::aws::{client::build_client_config, region_from_string};
+use crate::aws::{client::build_client_config_for_role, region_from_string};
 use crate::frompath::FromPath;
 use crate::Args;
 use aws_sdk_ebs::Client as EbsClient;
@@ -105,8 +105,9 @@ pub(crate) async fn run(args: &Args, ami_args: &AmiArgs) -> Result<()> {
     }
 }
 
-async fn _run(args: &Args, ami_args: &AmiArgs) -> Result<HashMap<String, Image>> {
-    let mut amis = HashMap::new();
+async fn _run(args: &Args, ami_args: &AmiArgs) -> Result<RegionAccountImageMap> {
+    // Maps each region to a map of account ID -> the AMI registered/copied into that account.
+    let mut amis: RegionAccountImageMap = HashMap::new();
 
     // If a lock file exists, use that, otherwise use Infra.toml or default
     let infra_config = InfraConfig::from_path_or_lock(&args.infra_config_path, true)
@@ -132,11 +133,20 @@ async fn _run(args: &Args, ami_args: &AmiArgs) -> Result<HashMap<String, Image>>
         }
     );
 
-    // We register in this base region first, then copy from there to any other regions.
+    // We register in this base region first, then copy from there to any other regions/accounts.
     let base_region = regions.remove(0);
 
+    // A region can target multiple accounts, one per configured role. We register the AMI once,
+    // using the first role of the base region (the "base account"), then copy it to every other
+    // (region, account) target.
+    let base_role = roles_for_region(&aws, &base_region)
+        .into_iter()
+        .next()
+        .flatten();
+
     // Build EBS client for snapshot management, and EC2 client for registration
-    let client_config = build_client_config(&base_region, &base_region, &aws).await;
+    let client_config =
+        build_client_config_for_role(&base_region, &base_region, &aws, base_role.as_deref()).await;
 
     let base_ebs_client = EbsClient::new(&client_config);
 
@@ -230,18 +240,42 @@ async fn _run(args: &Args, ami_args: &AmiArgs) -> Result<HashMap<String, Image>>
     #[expect(unused_variables)]
     let ami_args = ();
 
-    amis.insert(
-        base_region.as_ref().to_string(),
-        Image::new(
-            &ids_of_image.image_id,
-            &tentative_amispec.name,
-            Some(public),
-            Some(launch_permissions),
-        ),
-    );
+    // Resolve the account ID behind the base region's (base) role; this keys the source AMI in our
+    // output map.
+    let base_sts_client = StsClient::new(&client_config);
+    let base_account_id = get_account_id(&base_sts_client, &base_region).await?;
 
-    // If we don't need to copy AMIs, we're done.
-    if regions.is_empty() {
+    amis.entry(base_region.as_ref().to_string())
+        .or_default()
+        .insert(
+            base_account_id.clone(),
+            Image::new(
+                &ids_of_image.image_id,
+                &tentative_amispec.name,
+                Some(public),
+                Some(launch_permissions),
+            ),
+        );
+
+    // Build the full list of (region, role) targets we need to copy into, which is the cartesian
+    // product of every region and every role configured for it, minus the source (base region,
+    // base role) pair which we just registered above.
+    let mut targets = Vec::new();
+    for region in std::iter::once(&base_region).chain(regions.iter()) {
+        for role in roles_for_region(&aws, region) {
+            // Skip the source pair; it's already registered.
+            if region.as_ref() == base_region.as_ref() && role == base_role {
+                continue;
+            }
+            targets.push(RegionRole {
+                region: region.clone(),
+                role,
+            });
+        }
+    }
+
+    // If we don't need to copy AMIs to any other target, we're done.
+    if targets.is_empty() {
         return Ok(amis);
     }
 
@@ -254,6 +288,7 @@ async fn _run(args: &Args, ami_args: &AmiArgs) -> Result<HashMap<String, Image>>
         "available",
         successes_required,
         &aws,
+        base_role.clone(),
     )
     .await
     .context(error::WaitAmiSnafu {
@@ -261,39 +296,40 @@ async fn _run(args: &Args, ami_args: &AmiArgs) -> Result<HashMap<String, Image>>
         region: base_region.as_ref(),
     })?;
 
-    // For every other region, initiate copy-image calls.
+    // For every other target, initiate copy-image calls.
 
-    // First we need to find the account IDs for any given roles, so we can grant access to those
-    // accounts to copy the AMI and snapshots.
-    info!("Getting account IDs for target regions so we can grant access to copy source AMI");
-    let mut account_ids = get_account_ids(&regions, &base_region, &aws).await?;
+    // First, make EC2 and STS clients per target so we can resolve account IDs, fetch, and copy
+    // AMIs.  We make a map storing our clients because they're used in a future and need to live
+    // until the future is resolved.
+    let mut ec2_clients = HashMap::with_capacity(targets.len());
+    for target in targets.iter() {
+        let client_config = build_client_config_for_role(
+            &target.region,
+            &base_region,
+            &aws,
+            target.role.as_deref(),
+        )
+        .await;
+        let ec2_client = Ec2Client::new(&client_config);
+        ec2_clients.insert(target.clone(), ec2_client);
+    }
 
-    // Get the account ID used in the base region; we don't need to grant to it so we can remove it
-    // from the list.
-    let client_config = build_client_config(&base_region, &base_region, &aws).await;
-    let base_sts_client = StsClient::new(&client_config);
+    // Resolve the account ID behind each target's role so we can key the output map and grant
+    // access to the source snapshots/AMI.
+    info!("Getting account IDs for targets so we can grant access to copy source AMI");
+    let account_ids = get_account_ids(&targets, &base_region, &aws).await?;
 
-    let response = base_sts_client
-        .get_caller_identity()
-        .send()
-        .await
-        .map_err(AwsSdkError::from)
-        .context(error::GetCallerIdentitySnafu {
-            region: base_region.as_ref(),
-        })?;
-    let base_account_id = response.account.context(error::MissingInResponseSnafu {
-        request_type: "GetCallerIdentity",
-        missing: "account",
-    })?;
-    account_ids.remove(&base_account_id);
-
-    // If we have any accounts other than the base account, grant them access.
-    if !account_ids.is_empty() {
+    // Grant access to every target account (other than the base account) so they can copy the AMI
+    // and its snapshots.
+    let grant_account_ids: HashSet<String> = account_ids
+        .values()
+        .filter(|account_id| **account_id != base_account_id)
+        .cloned()
+        .collect();
+    if !grant_account_ids.is_empty() {
         info!("Granting access to target accounts so we can copy the AMI");
-        let account_id_vec: Vec<_> = account_ids.into_iter().collect();
-
         let modify_options = ModifyOptions {
-            user_ids: account_id_vec,
+            user_ids: grant_account_ids.into_iter().collect(),
             group_names: Vec::new(),
             organization_arns: Vec::new(),
             organizational_unit_arns: Vec::new(),
@@ -325,31 +361,26 @@ async fn _run(args: &Args, ami_args: &AmiArgs) -> Result<HashMap<String, Image>>
         })?;
     }
 
-    // Next, make EC2 clients so we can fetch and copy AMIs.  We make a map storing our regional
-    // clients because they're used in a future and need to live until the future is resolved.
-    let mut ec2_clients = HashMap::with_capacity(regions.len());
-    for region in regions.iter() {
-        let client_config = build_client_config(region, &base_region, &aws).await;
-        let ec2_client = Ec2Client::new(&client_config);
-        ec2_clients.insert(region.clone(), ec2_client);
-    }
-
-    // First, we check if the AMI already exists in each region.
-    info!("Checking whether AMIs already exist in target regions");
-    let mut get_requests = Vec::with_capacity(regions.len());
-    for region in regions.iter() {
-        let ec2_client = &ec2_clients[region];
-        let get_request = get_ami_id(&tentative_amispec.name, &arch, region, ec2_client);
-        let info_future = ready(region.clone());
+    // First, we check if the AMI already exists in each target (region + account).
+    info!("Checking whether AMIs already exist in target regions/accounts");
+    let mut get_requests = Vec::with_capacity(targets.len());
+    for target in targets.iter() {
+        let ec2_client = &ec2_clients[target];
+        let get_request = get_ami_id(&tentative_amispec.name, &arch, &target.region, ec2_client);
+        let info_future = ready(target.clone());
         get_requests.push(join(info_future, get_request));
     }
     let request_stream = stream::iter(get_requests).buffer_unordered(4);
-    let get_responses: Vec<(Region, std::result::Result<Option<String>, register::Error>)> =
-        request_stream.collect().await;
+    let get_responses: Vec<(
+        RegionRole,
+        std::result::Result<Option<String>, register::Error>,
+    )> = request_stream.collect().await;
 
     // If an AMI already existed, just add it to our list, otherwise prepare a copy request.
-    let mut copy_requests = Vec::with_capacity(regions.len());
-    for (region, get_response) in get_responses {
+    let mut copy_requests = Vec::with_capacity(targets.len());
+    for (target, get_response) in get_responses {
+        let region = &target.region;
+        let account_id = &account_ids[&target];
         let get_response = get_response.context(error::GetAmiIdSnafu {
             name: &tentative_amispec.name,
             arch: &arch,
@@ -357,10 +388,10 @@ async fn _run(args: &Args, ami_args: &AmiArgs) -> Result<HashMap<String, Image>>
         })?;
         if let Some(id) = get_response {
             info!(
-                "Found '{}' already registered in {}: {}",
-                tentative_amispec.name, region, id
+                "Found '{}' already registered in {} ({}): {}",
+                tentative_amispec.name, region, account_id, id
             );
-            let public = ami_is_public(&ec2_clients[&region], region.as_ref(), &id)
+            let public = ami_is_public(&ec2_clients[&target], region.as_ref(), &id)
                 .await
                 .context(error::IsAmiPublicSnafu {
                     image_id: id.clone(),
@@ -368,15 +399,15 @@ async fn _run(args: &Args, ami_args: &AmiArgs) -> Result<HashMap<String, Image>>
                 })?;
 
             let launch_permissions =
-                get_launch_permissions(&ec2_clients[&region], region.as_ref(), &id)
+                get_launch_permissions(&ec2_clients[&target], region.as_ref(), &id)
                     .await
                     .context(error::DescribeImageAttributeSnafu {
                         region: region.as_ref(),
                         image_id: id.clone(),
                     })?;
 
-            amis.insert(
-                region.as_ref().to_string(),
+            amis.entry(region.as_ref().to_string()).or_default().insert(
+                account_id.clone(),
                 Image::new(
                     &id,
                     &tentative_amispec.name,
@@ -387,7 +418,7 @@ async fn _run(args: &Args, ami_args: &AmiArgs) -> Result<HashMap<String, Image>>
             continue;
         }
 
-        let ec2_client = &ec2_clients[&region];
+        let ec2_client = &ec2_clients[&target];
         let base_region = base_region.to_owned();
         let copy_future = ec2_client
             .copy_image()
@@ -399,14 +430,18 @@ async fn _run(args: &Args, ami_args: &AmiArgs) -> Result<HashMap<String, Image>>
             .send()
             .map_err(AwsSdkError::from);
 
-        // Store the region so we can output it to the user
-        let region_future = ready(region.clone());
+        // Store the target so we can output it to the user
+        let target_future = ready(target.clone());
         // Let the user know the copy is starting, when this future goes to run
-        let message_future = lazy(move |_| info!("Starting copy from {base_region} to {region}"));
-        copy_requests.push(message_future.then(|_| join(region_future, copy_future)));
+        let dest_region = region.clone();
+        let dest_account = account_id.clone();
+        let message_future = lazy(move |_| {
+            info!("Starting copy from {base_region} to {dest_region} ({dest_account})")
+        });
+        copy_requests.push(message_future.then(|_| join(target_future, copy_future)));
     }
 
-    // If all target regions already have the AMI, we're done.
+    // If all targets already have the AMI, we're done.
     if copy_requests.is_empty() {
         return Ok(amis);
     }
@@ -415,27 +450,29 @@ async fn _run(args: &Args, ami_args: &AmiArgs) -> Result<HashMap<String, Image>>
     // afterward.  You should wait for the AMI status to be "available" before launching it.
     // (We still use buffer_unordered, rather than something like join_all, to retain some control
     // over the number of requests going out in case we need it later, but this will effectively
-    // spin through all regions quickly because the requests return before any copying is done.)
+    // spin through all targets quickly because the requests return before any copying is done.)
     let request_stream = stream::iter(copy_requests).buffer_unordered(4);
     // Run through the stream and collect results into a list.
     let copy_responses: Vec<(
-        Region,
+        RegionRole,
         std::result::Result<CopyImageOutput, AwsSdkError<CopyImageError>>,
     )> = request_stream.collect().await;
 
     // Report on successes and errors; don't fail immediately if we see an error so we can report
     // all successful IDs.
     let mut saw_error = false;
-    for (region, copy_response) in copy_responses {
+    for (target, copy_response) in copy_responses {
+        let region = &target.region;
+        let account_id = &account_ids[&target];
         match copy_response {
             Ok(success) => {
                 if let Some(image_id) = success.image_id {
                     info!(
-                        "Registered AMI '{}' in {}: {}",
-                        tentative_amispec.name, region, image_id,
+                        "Registered AMI '{}' in {} ({}): {}",
+                        tentative_amispec.name, region, account_id, image_id,
                     );
-                    amis.insert(
-                        region.as_ref().to_string(),
+                    amis.entry(region.as_ref().to_string()).or_default().insert(
+                        account_id.clone(),
                         Image::new(
                             &image_id,
                             &tentative_amispec.name,
@@ -446,16 +483,17 @@ async fn _run(args: &Args, ami_args: &AmiArgs) -> Result<HashMap<String, Image>>
                 } else {
                     saw_error = true;
                     error!(
-                        "Registered AMI '{}' in {} but didn't receive an AMI ID!",
-                        tentative_amispec.name, region,
+                        "Registered AMI '{}' in {} ({}) but didn't receive an AMI ID!",
+                        tentative_amispec.name, region, account_id,
                     );
                 }
             }
             Err(e) => {
                 saw_error = true;
                 error!(
-                    "Copy to {} failed: {}",
+                    "Copy to {} ({}) failed: {}",
                     region,
+                    account_id,
                     e.as_service_error()
                         .and_then(|err| err.code())
                         .unwrap_or("unknown")
@@ -467,6 +505,43 @@ async fn _run(args: &Args, ami_args: &AmiArgs) -> Result<HashMap<String, Image>>
     ensure!(!saw_error, error::AmiCopySnafu);
 
     Ok(amis)
+}
+
+/// An account ID, in its 12-digit string form.
+pub(crate) type AccountId = String;
+
+/// The output of an AMI publish run: for each region, a map of account ID to the AMI that was
+/// registered or copied into that account.  A single region can map to multiple accounts when
+/// multiple roles are configured for it.  The `ssm` and `publish-ami` subcommands consume this
+/// (serialized to JSON) to know which AMIs exist where.
+pub(crate) type RegionAccountImageMap = HashMap<String, HashMap<AccountId, Image>>;
+
+/// Identifies a single copy target: a region together with the role to assume to reach a
+/// particular account in that region.  A `None` role means "use the base/global credentials".
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct RegionRole {
+    pub(crate) region: Region,
+    pub(crate) role: Option<String>,
+}
+
+/// Identifies a single AMI: a region together with the account that owns the AMI.  A single region
+/// can contain multiple accounts when multiple roles are configured for it.  The `ssm` and
+/// `publish-ami` subcommands use this to key AMIs read from the input JSON.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct RegionAccount {
+    pub(crate) region: Region,
+    pub(crate) account_id: AccountId,
+}
+
+/// Returns every role configured for the given region (see `AwsRegionConfig::all_roles`).  If the
+/// region has no entry in the config, returns a single `None`, meaning "use the base/global
+/// credentials without assuming a region-specific role".
+fn roles_for_region(pubsys_aws_config: &PubsysAwsConfig, region: &Region) -> Vec<Option<String>> {
+    pubsys_aws_config
+        .region
+        .get(region.as_ref())
+        .map(|region_config| region_config.all_roles())
+        .unwrap_or_else(|| vec![None])
 }
 
 /// If JSON output was requested, we serialize out a mapping of region to AMI information; this
@@ -496,56 +571,79 @@ impl Image {
     }
 }
 
-/// Returns the set of account IDs associated with the roles configured for the given regions.
+/// Resolves the account ID reachable through the given STS client (in the given region, used only
+/// for error messages).
+async fn get_account_id(sts_client: &StsClient, region: &Region) -> Result<String> {
+    let response = sts_client
+        .get_caller_identity()
+        .send()
+        .await
+        .map_err(AwsSdkError::from)
+        .context(error::GetCallerIdentitySnafu {
+            region: region.as_ref(),
+        })?;
+    response.account.context(error::MissingInResponseSnafu {
+        request_type: "GetCallerIdentity",
+        missing: "account",
+    })
+}
+
+/// Resolves the account ID for each given target by assuming its role and calling
+/// GetCallerIdentity.  Returns a mapping of target to its account ID.
 async fn get_account_ids(
-    regions: &[Region],
+    targets: &[RegionRole],
     base_region: &Region,
     pubsys_aws_config: &PubsysAwsConfig,
-) -> Result<HashSet<String>> {
-    let mut grant_accounts = HashSet::new();
-
-    // We make a map storing our regional clients because they're used in a future and need to
-    // live until the future is resolved.
-    let mut sts_clients = HashMap::with_capacity(regions.len());
-    for region in regions.iter() {
-        let client_config = build_client_config(region, base_region, pubsys_aws_config).await;
+) -> Result<HashMap<RegionRole, String>> {
+    // We make a map storing our clients because they're used in a future and need to live until
+    // the future is resolved.
+    let mut sts_clients = HashMap::with_capacity(targets.len());
+    for target in targets.iter() {
+        let client_config = build_client_config_for_role(
+            &target.region,
+            base_region,
+            pubsys_aws_config,
+            target.role.as_deref(),
+        )
+        .await;
         let sts_client = StsClient::new(&client_config);
-        sts_clients.insert(region.clone(), sts_client);
+        sts_clients.insert(target.clone(), sts_client);
     }
 
-    let mut requests = Vec::with_capacity(regions.len());
-    for region in regions.iter() {
-        let sts_client = &sts_clients[region];
+    let mut requests = Vec::with_capacity(targets.len());
+    for target in targets.iter() {
+        let sts_client = &sts_clients[target];
         let response_future = sts_client
             .get_caller_identity()
             .send()
             .map_err(AwsSdkError::from);
 
-        // Store the region so we can include it in any errors
-        let region_future = ready(region.clone());
-        requests.push(join(region_future, response_future));
+        // Store the target so we can include it in any errors and key the result
+        let target_future = ready(target.clone());
+        requests.push(join(target_future, response_future));
     }
 
     let request_stream = stream::iter(requests).buffer_unordered(4);
     // Run through the stream and collect results into a list.
     let responses: Vec<(
-        Region,
+        RegionRole,
         std::result::Result<GetCallerIdentityOutput, AwsSdkError<GetCallerIdentityError>>,
     )> = request_stream.collect().await;
 
-    for (region, response) in responses {
+    let mut account_ids = HashMap::with_capacity(targets.len());
+    for (target, response) in responses {
         let response = response.context(error::GetCallerIdentitySnafu {
-            region: region.as_ref(),
+            region: target.region.as_ref(),
         })?;
         let account_id = response.account.context(error::MissingInResponseSnafu {
             request_type: "GetCallerIdentity",
             missing: "account",
         })?;
-        grant_accounts.insert(account_id);
+        account_ids.insert(target, account_id);
     }
-    trace!("Found account IDs {grant_accounts:?}");
+    trace!("Found account IDs {account_ids:?}");
 
-    Ok(grant_accounts)
+    Ok(account_ids)
 }
 
 /// Parses a toml file, returning a `FromPath<T>`.
@@ -733,3 +831,66 @@ use self::launch_permissions::LaunchPermissionDef;
 
 use super::publish_ami::write_amis;
 type Result<T> = std::result::Result<T, error::Error>;
+
+#[cfg(test)]
+mod test {
+    use super::{Image, RegionAccountImageMap};
+
+    /// The `--ami-input` JSON contract is shared by the `ami`, `ssm`, and `publish-ami`
+    /// subcommands.  This locks its nested `region -> account -> image` shape.
+    #[test]
+    fn region_account_image_map_json_round_trip() {
+        let json = r#"{
+            "us-west-2": {
+                "777777777777": {
+                    "id": "ami-aaa",
+                    "name": "my-ami",
+                    "public": false,
+                    "launch_permissions": []
+                },
+                "999999999999": {
+                    "id": "ami-bbb",
+                    "name": "my-ami",
+                    "public": false,
+                    "launch_permissions": []
+                }
+            },
+            "us-east-1": {
+                "777777777777": {
+                    "id": "ami-ccc",
+                    "name": "my-ami",
+                    "public": true,
+                    "launch_permissions": null
+                }
+            }
+        }"#;
+
+        let parsed: RegionAccountImageMap = serde_json::from_str(json).unwrap();
+
+        // Two accounts in us-west-2, one in us-east-1.
+        assert_eq!(parsed["us-west-2"].len(), 2);
+        assert_eq!(parsed["us-west-2"]["777777777777"].id, "ami-aaa");
+        assert_eq!(parsed["us-west-2"]["999999999999"].id, "ami-bbb");
+        assert_eq!(parsed["us-east-1"].len(), 1);
+        assert_eq!(parsed["us-east-1"]["777777777777"].public, Some(true));
+
+        // Round-trips back to an equivalent structure.
+        let reserialized = serde_json::to_string(&parsed).unwrap();
+        let reparsed: RegionAccountImageMap = serde_json::from_str(&reserialized).unwrap();
+        assert_eq!(parsed, reparsed);
+    }
+
+    /// A single account per region (the common case) is just a one-entry inner map.
+    #[test]
+    fn region_account_image_map_single_account() {
+        let mut map = RegionAccountImageMap::new();
+        map.entry("us-west-2".to_string()).or_default().insert(
+            "123456789012".to_string(),
+            Image::new("ami-123", "my-ami", Some(false), Some(vec![])),
+        );
+
+        let json = serde_json::to_string(&map).unwrap();
+        let parsed: RegionAccountImageMap = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["us-west-2"]["123456789012"].id, "ami-123");
+    }
+}

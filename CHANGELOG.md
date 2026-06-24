@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+* pubsys: support publishing a single AMI into multiple accounts within the same region via a new `roles` list on `[aws.region.*]` ([#4858])
+
+### Changed
+* **Breaking change (intermediate artifact):** pubsys: the `--ami-input` JSON produced by `pubsys ami` and consumed by `pubsys ssm` / `pubsys publish-ami` is now nested by account (`{region: {account_id: {…ami…}}}`) instead of `{region: {…ami…}}`. This file is a transient per-run artifact; `ami`, `ssm`, and `publish-ami` are updated in lockstep, but any external tooling that reads it must be updated. ([#4858])
+
+[#4858]: https://github.com/bottlerocket-os/bottlerocket/issues/4858
+
 [unreleased]: https://github.com/bottlerocket-os/twoliter/compare/v0.20.0...HEAD
 
 ## [0.21.0] - 2026-06-19
